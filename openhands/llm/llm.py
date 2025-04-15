@@ -34,6 +34,16 @@ from openhands.llm.fn_call_converter import (
 from openhands.llm.metrics import Metrics
 from openhands.llm.retry_mixin import RetryMixin
 
+from phoenix.otel import register
+from opentelemetry import trace
+
+endpoint = "http://192.168.68.105:6006/v1/traces"
+tracer_provider = register(
+  endpoint=endpoint,
+  project_name="openhands", # Default is 'default'
+  auto_instrument=True # Auto-instrument your app based on installed OI dependencies
+)
+
 __all__ = ['LLM']
 
 # tuple of exceptions to retry on
@@ -256,41 +266,103 @@ class LLM(RetryMixin, DebugMixin):
             logger.debug(
                 f'LLM: calling litellm completion with model: {self.config.model}, base_url: {self.config.base_url}, args: {args}, kwargs: {kwargs}'
             )
-            resp: ModelResponse = self._completion_unwrapped(*args, **kwargs)
+            tracer = trace.get_tracer(__name__)
+            with tracer.start_as_current_span(
+                "LLM Call",
+                attributes={
+                    "openinference.span.kind": "LLM",
+                    "input.value": json.dumps(kwargs),
+                },
+            ) as span:
+                
+                resp: ModelResponse = self._completion_unwrapped(*args, **kwargs)
+                
+                for idx, message in enumerate(messages):
+                    trace_message = {"message": {"role": message['role']}}
+                    
+                    if message['role'] == 'tool':  # Handling tool calls
+                        trace_message["message"].update({
+                            "tool_call_id": message.get('tool_call_id', 'N/A'),
+                            "content": message.get('content', '') if isinstance(message.get('content'), str) else str(message.get('content'))
+                        })
+                    
+                    elif message['role'] == 'agent':  # Handling tool calls made by agents
+                        tool_calls = message.get("tool_calls", [])
+                        trace_message["message"].update({
+                            "tool_calls": [
+                                {"tool_call": {
+                                    "id": tool_call.get("id", "N/A"),
+                                    "function": tool_call.get("function", "unknown"),
+                                    "arguments": tool_call.get("arguments", {}),
+                                }}
+                                for tool_call in tool_calls
+                            ]
+                        })
+                    
+                    else:  # Handling standard messages
+                        content = message.get('content', '')
+                        if isinstance(content, list):
+                            content = "\n\n".join([c.get('text', '') for c in content])
+                        trace_message["message"].update({"content": content})
+                    
+                    print(json.dumps(trace_message, indent=4))
+                    
+                    def set_nested_attributes(base_key, value):
+                        if isinstance(value, dict):
+                            for k, v in value.items():
+                                set_nested_attributes(f"{base_key}.{k}", v)
+                        elif isinstance(value, list):
+                            for i, v in enumerate(value):
+                                set_nested_attributes(f"{base_key}.{i}", v)
+                        else:
+                            span.set_attribute(base_key, value)
+                    
+                    for key, value in trace_message["message"].items():
+                        set_nested_attributes(f"llm.input_messages.{idx}.message.{key}", value)
+                
+                if "tools" in kwargs:
+                    for idx, tool in enumerate(kwargs["tools"]):
+                        tool_key = f"llm.tools.{idx}"
+                        set_nested_attributes(tool_key, tool)
 
-            # Calculate and record latency
-            latency = time.time() - start_time
-            response_id = resp.get('id', 'unknown')
-            self.metrics.add_response_latency(latency, response_id)
+                # Calculate and record latency
+                latency = time.time() - start_time
+                response_id = resp.get('id', 'unknown')
+                self.metrics.add_response_latency(latency, response_id)
 
-            non_fncall_response = copy.deepcopy(resp)
+                non_fncall_response = copy.deepcopy(resp)
 
-            # if we mocked function calling, and we have tools, convert the response back to function calling format
-            if mock_function_calling and mock_fncall_tools is not None:
-                logger.debug(f'Response choices: {len(resp.choices)}')
-                assert len(resp.choices) >= 1
-                non_fncall_response_message = resp.choices[0].message
-                fn_call_messages_with_response = (
-                    convert_non_fncall_messages_to_fncall_messages(
-                        messages + [non_fncall_response_message], mock_fncall_tools
+                # if we mocked function calling, and we have tools, convert the response back to function calling format
+                if mock_function_calling and mock_fncall_tools is not None:
+                    logger.debug(f'Response choices: {len(resp.choices)}')
+                    assert len(resp.choices) >= 1
+                    non_fncall_response_message = resp.choices[0].message
+                    fn_call_messages_with_response = (
+                        convert_non_fncall_messages_to_fncall_messages(
+                            messages + [non_fncall_response_message], mock_fncall_tools
+                        )
                     )
-                )
-                fn_call_response_message = fn_call_messages_with_response[-1]
-                if not isinstance(fn_call_response_message, LiteLLMMessage):
-                    fn_call_response_message = LiteLLMMessage(
-                        **fn_call_response_message
-                    )
-                resp.choices[0].message = fn_call_response_message
+                    fn_call_response_message = fn_call_messages_with_response[-1]
+                    if not isinstance(fn_call_response_message, LiteLLMMessage):
+                        fn_call_response_message = LiteLLMMessage(
+                            **fn_call_response_message
+                        )
+                    resp.choices[0].message = fn_call_response_message
 
-            message_back: str = resp['choices'][0]['message']['content'] or ''
-            tool_calls: list[ChatCompletionMessageToolCall] = resp['choices'][0][
-                'message'
-            ].get('tool_calls', [])
-            if tool_calls:
-                for tool_call in tool_calls:
-                    fn_name = tool_call.function.name
-                    fn_args = tool_call.function.arguments
-                    message_back += f'\nFunction call: {fn_name}({fn_args})'
+                message_back: str = resp['choices'][0]['message']['content'] or ''
+                tool_calls: list[ChatCompletionMessageToolCall] = resp['choices'][0][
+                    'message'
+                ].get('tool_calls', [])
+                if tool_calls:
+                    for tool_call in tool_calls:
+                        fn_name = tool_call.function.name
+                        fn_args = tool_call.function.arguments
+                        message_back += f'\nFunction call: {fn_name}({fn_args})'
+
+                span.set_attribute("llm.model_name", resp["model"])
+                span.set_attribute("output.value", message_back)
+                span.set_attribute("llm.output_messages.0.message.content", message_back)
+                span.set_attribute("llm.output_messages.0.message.role", "assistant")
 
             # log the LLM response
             self.log_response(message_back)
@@ -551,14 +623,16 @@ class LLM(RetryMixin, DebugMixin):
                 'prompt_tokens_details'
             )
             cache_hit_tokens = (
-                prompt_tokens_details.cached_tokens if prompt_tokens_details else 0
+                prompt_tokens_details.cached_tokens
+                if prompt_tokens_details and prompt_tokens_details.cached_tokens
+                else 0
             )
             if cache_hit_tokens:
                 stats += 'Input tokens (cache hit): ' + str(cache_hit_tokens) + '\n'
 
             # For Anthropic, the cache writes have a different cost than regular input tokens
             # but litellm doesn't separate them in the usage stats
-            # so we can read it from the provider-specific extra field
+            # we can read it from the provider-specific extra field
             model_extra = usage.get('model_extra', {})
             cache_write_tokens = model_extra.get('cache_creation_input_tokens', 0)
             if cache_write_tokens:
