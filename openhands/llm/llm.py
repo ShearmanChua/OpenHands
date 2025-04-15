@@ -37,7 +37,7 @@ from openhands.llm.retry_mixin import RetryMixin
 from phoenix.otel import register
 from opentelemetry import trace
 
-endpoint = "http://192.168.68.105:6006/v1/traces"
+endpoint = "http://128.2.209.71:6006/v1/traces"
 tracer_provider = register(
   endpoint=endpoint,
   project_name="openhands", # Default is 'default'
@@ -275,9 +275,13 @@ class LLM(RetryMixin, DebugMixin):
                 },
             ) as span:
                 
-                resp: ModelResponse = self._completion_unwrapped(*args, **kwargs)
+                try:
+                    resp: ModelResponse = self._completion_unwrapped(*args, **kwargs)
+                except Exception as e:
+                    print(f"AHAHHHHHHHHHH: {e}")
                 
                 for idx, message in enumerate(messages):
+                    # print("ORIGINAL MESSAGE: ",json.dumps(message, indent=4))
                     trace_message = {"message": {"role": message['role']}}
                     
                     if message['role'] == 'tool':  # Handling tool calls
@@ -305,7 +309,7 @@ class LLM(RetryMixin, DebugMixin):
                             content = "\n\n".join([c.get('text', '') for c in content])
                         trace_message["message"].update({"content": content})
                     
-                    print(json.dumps(trace_message, indent=4))
+                    # print(json.dumps(trace_message, indent=4))
                     
                     def set_nested_attributes(base_key, value):
                         if isinstance(value, dict):
@@ -319,11 +323,13 @@ class LLM(RetryMixin, DebugMixin):
                     
                     for key, value in trace_message["message"].items():
                         set_nested_attributes(f"llm.input_messages.{idx}.message.{key}", value)
+                        span.set_attribute(f"llm.input_messages.{idx}.message.role", trace_message["message"]["role"])
                 
                 if "tools" in kwargs:
                     for idx, tool in enumerate(kwargs["tools"]):
-                        tool_key = f"llm.tools.{idx}"
-                        set_nested_attributes(tool_key, tool)
+                        print("TOOL: ", tool)
+                        tool_key = f"llm.tools.{idx}.tool.json_schema"
+                        set_nested_attributes(tool_key, json.dumps(tool))
 
                 # Calculate and record latency
                 latency = time.time() - start_time
