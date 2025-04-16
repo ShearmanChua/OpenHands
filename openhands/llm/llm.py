@@ -290,7 +290,7 @@ class LLM(RetryMixin, DebugMixin):
                             "content": message.get('content', '') if isinstance(message.get('content'), str) else str(message.get('content'))
                         })
                     
-                    elif message['role'] == 'agent':  # Handling tool calls made by agents
+                    elif message['role'] == 'assistant' and message.get("tool_calls"):  # Handling tool calls made by agents
                         tool_calls = message.get("tool_calls", [])
                         trace_message["message"].update({
                             "tool_calls": [
@@ -337,6 +337,11 @@ class LLM(RetryMixin, DebugMixin):
                 self.metrics.add_response_latency(latency, response_id)
 
                 non_fncall_response = copy.deepcopy(resp)
+                
+                span.set_attribute("llm.model_name", resp["model"])
+                span.set_attribute("output.value", json.dumps(resp.json()))
+                set_nested_attributes("llm.output_messages.0.message", resp.choices[0].message.json())
+                span.set_attribute("llm.output_messages.0.message.role", "assistant")
 
                 # if we mocked function calling, and we have tools, convert the response back to function calling format
                 if mock_function_calling and mock_fncall_tools is not None:
@@ -364,11 +369,6 @@ class LLM(RetryMixin, DebugMixin):
                         fn_name = tool_call.function.name
                         fn_args = tool_call.function.arguments
                         message_back += f'\nFunction call: {fn_name}({fn_args})'
-
-                span.set_attribute("llm.model_name", resp["model"])
-                span.set_attribute("output.value", message_back)
-                span.set_attribute("llm.output_messages.0.message.content", message_back)
-                span.set_attribute("llm.output_messages.0.message.role", "assistant")
 
             # log the LLM response
             self.log_response(message_back)
